@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  html-validate:
+    name: HTML validity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npx --yes html-validate@9.7.1 "**/*.html"
+
+  deploy:
+    name: deploy to Cloudflare Pages
+    needs: [html-validate]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      PAGES_PROJECT: qg-site
+    steps:
+      - name: Require Cloudflare secrets
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::error::CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID secrets are not set on this repo"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - name: Stage site (repo root without dotfiles)
+        run: rsync -a --exclude='.*' ./ "$RUNNER_TEMP/site/"
+      - name: Ensure Pages project exists
+        run: npx --yes wrangler@3 pages project create "$PAGES_PROJECT" --production-branch main || echo "project already exists"
+      - id: wrangler
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy ${{ runner.temp }}/site --project-name qg-site --branch main
+      - name: Smoke test deployment URL
+        env:
+          DEPLOY_URL: ${{ steps.wrangler.outputs.deployment-url }}
+        run: |
+          echo "deployment: $DEPLOY_URL"
+          for path in / /aboutus/ /blog/ /contactus/ /donations/ /resources/; do
+            curl -fsS -o /dev/null --retry 5 --retry-delay 5 --retry-all-errors -w "%{http_code} $path\n" "$DEPLOY_URL$path"
+          done
